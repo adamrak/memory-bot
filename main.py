@@ -5,12 +5,14 @@ import logging
 import os
 import re
 import tarfile
+import time
 import unicodedata
 from datetime import date
 from urllib.parse import quote
 
 import aiohttp
 import discord
+import httpx
 from aiohttp import web
 from discord.ext import commands, tasks
 from google import genai
@@ -21,13 +23,19 @@ log = logging.getLogger("memorybot")
 
 # --- Config (environment variables) ---
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-OWNER_ID = int(os.environ["OWNER_ID"])
+_owner = os.environ["OWNER_ID"].strip()
+if not _owner.isdigit():
+    raise SystemExit(f"OWNER_ID must be your numeric Discord user ID (Developer Mode → Copy User ID), got {_owner!r}")
+OWNER_ID = int(_owner)
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))  # optional: only this channel + its threads
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 GITHUB_REPO = os.environ["GITHUB_REPO"]  # "owner/repo"
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "")  # empty = repo default branch
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+# Comma-separated, tried in order; next one is used when the previous times out / returns 5xx
+GEMINI_MODELS = [m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-3.8-flash,gemini-3.5-flash").split(",") if m.strip()]
+GEMINI_THINKING = os.getenv("GEMINI_THINKING", "low").strip()  # "low" / "high" / empty = model default
+GEMINI_TIMEOUT_S = int(os.getenv("GEMINI_TIMEOUT_S", "45"))
 SYNC_MINUTES = float(os.getenv("SYNC_MINUTES", "5"))
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "50"))
 HISTORY_MAX_CHARS = int(os.getenv("HISTORY_MAX_CHARS", "40000"))
@@ -37,6 +45,7 @@ GITHUB_API = "https://api.github.com"
 DISCORD_LIMIT = 2000
 PREVIEW_CHARS = 1700
 SAVE_TRIGGER = re.compile(r"^\s*(zapis|uloz|save)\b", re.IGNORECASE)
+USER_MESSAGE_TYPES = (discord.MessageType.default, discord.MessageType.reply)
 
 ANSWER_PROMPT = """You are a personal memory assistant for a single user. Below are their notes \
 from a private GitHub repository (markdown files).
@@ -218,28 +227,47 @@ class MemoryStore:
 
 
 store = MemoryStore()
-gemini = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=120_000))
+gemini = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_S * 1000))
 
 
 # --- Gemini ---
+def make_config(**kwargs) -> types.GenerateContentConfig:
+    if GEMINI_THINKING:
+        kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=GEMINI_THINKING)
+    return types.GenerateContentConfig(
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        **kwargs,
+    )
+
+
+async def generate(contents, config: types.GenerateContentConfig) -> types.GenerateContentResponse:
+    """Try models in order; fall back to the next one on server errors / timeouts."""
+    last_error: Exception | None = None
+    for model in GEMINI_MODELS:
+        start = time.monotonic()
+        try:
+            resp = await gemini.aio.models.generate_content(model=model, contents=contents, config=config)
+            log.info("Gemini %s answered in %.1fs", model, time.monotonic() - start)
+            return resp
+        except (errors.ServerError, httpx.TimeoutException) as e:
+            log.warning("Gemini %s failed after %.1fs: %s", model, time.monotonic() - start, e)
+            last_error = e
+    raise last_error
+
+
 async def gemini_answer(history: list[types.Content]) -> str:
     notes = "\n".join(f"\n--- FILE: {p} ---\n{t}" for p, t in sorted(store.files.items())) or "(no notes yet)"
-    resp = await gemini.aio.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=history,
-        config=types.GenerateContentConfig(
-            system_instruction=ANSWER_PROMPT.format(count=len(store.files), notes=notes, today=date.today()),
-        ),
-    )
+    system = ANSWER_PROMPT.format(count=len(store.files), notes=notes, today=date.today())
+    log.info("Answering: %d history turns, %d chars of notes", len(history), len(notes))
+    resp = await generate(history, make_config(system_instruction=system))
     return resp.text or "⚠️ Gemini returned an empty response (possibly blocked by safety filters)."
 
 
 async def gemini_save_plan(history: list[types.Content]) -> SavePlan:
     tree = "\n".join(sorted(store.files)) or "(empty repository)"
-    resp = await gemini.aio.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=history,
-        config=types.GenerateContentConfig(
+    resp = await generate(
+        history,
+        make_config(
             system_instruction=SAVE_PROMPT.format(today=date.today(), tree=tree),
             response_mime_type="application/json",
             response_schema=SavePlan,
@@ -267,7 +295,7 @@ async def build_history(thread: discord.Thread) -> list[types.Content]:
         if starter:
             msgs.insert(0, starter)
 
-    msgs = [m for m in msgs if m.type in (discord.MessageType.default, discord.MessageType.reply) and m.clean_content]
+    msgs = [m for m in msgs if m.type in USER_MESSAGE_TYPES and m.clean_content]
 
     # Keep the newest messages within the char budget
     kept, total = [], 0
@@ -358,7 +386,7 @@ async def start_health_server(port: int):
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", port).start()
     log.info("Health server listening on :%d", port)
@@ -392,7 +420,7 @@ bot = MemoryBot(command_prefix="!", intents=intents, owner_id=OWNER_ID)
 
 @bot.event
 async def on_ready():
-    log.info("Logged in as %s", bot.user)
+    log.info("Logged in as %s (models: %s, thinking: %s)", bot.user, ", ".join(GEMINI_MODELS), GEMINI_THINKING or "default")
 
 
 @bot.command(name="sync")
@@ -406,10 +434,29 @@ async def sync_cmd(ctx: commands.Context):
     await ctx.reply(f"{state}: {len(store.files)} notes @ `{(store.sha or '-')[:7]}`")
 
 
+@bot.command(name="ping")
+async def ping_cmd(ctx: commands.Context):
+    """Bare Gemini call (no notes, no history) against each configured model, with timing."""
+    lines = []
+    async with ctx.typing():
+        for model in GEMINI_MODELS:
+            start = time.monotonic()
+            try:
+                resp = await gemini.aio.models.generate_content(
+                    model=model, contents="Reply with one word: hi", config=make_config()
+                )
+                lines.append(f"✅ `{model}` {time.monotonic() - start:.1f}s → {(resp.text or '').strip()[:50]!r}")
+            except Exception as e:
+                lines.append(f"❌ `{model}` {time.monotonic() - start:.1f}s → {type(e).__name__}: {str(e)[:150]}")
+    await ctx.reply("\n".join(lines))
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or message.author.id != OWNER_ID:
         return
+    if message.type not in USER_MESSAGE_TYPES:
+        return  # ignore system messages (thread created, pins, joins, …)
     channel = message.channel
     if not isinstance(channel, (discord.TextChannel, discord.Thread)):
         return
@@ -442,6 +489,9 @@ async def on_message(message: discord.Message):
             await thread.send("⏳ Gemini rate limit, skús o chvíľu.")
         else:
             await thread.send(f"❌ Gemini error {e.code}: {str(e.message)[:300]}")
+    except httpx.TimeoutException:
+        log.exception("Gemini timeout")
+        await thread.send("⌛ Gemini neodpovedal včas, skús znova.")
     except Exception as e:
         log.exception("Failed to handle message")
         await thread.send(f"❌ {type(e).__name__}: {str(e)[:300]}")
