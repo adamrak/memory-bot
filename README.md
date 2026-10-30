@@ -11,6 +11,9 @@ Personal assistant on Discord that answers from (and saves to) markdown notes in
 - `oprav …` / `zmaž …` / `presuň …` / `edit` / `delete` → Gemini proposes changes, you get a diff with **✅ Apply / ❌ Cancel**.
   One commit per change. Attachments follow their note: when a note moves, its files move next to it
   (unless another note links them too); attachments no longer linked from any note are deleted.
+- `vráť` / `undo` / `revert` (or `!undo`) → preview of the last commit with **↩️ Revert / ❌ Cancel**.
+  Reverting creates a new commit restoring every touched file (notes and attachments) to its previous version.
+  Running it again right after undoes the revert.
 - Ask for a stored file ("ukáž mi návod k akaso") → the bot sends it (or a GitHub link if > 10 MB).
 - `!sync` → pull the latest notes from GitHub now (it also syncs automatically every 5 minutes).
 - `!ping` → test Gemini latency of each configured model.

@@ -64,6 +64,7 @@ EDIT_TRIGGER = re.compile(
     r"|presun|presunut|premenuj|premenovat|edit|update|delete|remove|move|rename)\b",
     re.IGNORECASE,
 )
+REVERT_TRIGGER = re.compile(r"^\s*(vrat|vratit|revert|undo)\b", re.IGNORECASE)
 ATTACH_LINE = re.compile(r"^\s*ATTACH:\s*(\S+)\s*$", re.MULTILINE)
 PDF_READ_TRIGGER = re.compile(
     r"\b(precitaj|precitat|analyzuj|rozober|parsuj|vytiahni|read|parse|extract|analy[sz]e)\b", re.IGNORECASE
@@ -86,7 +87,7 @@ photo is essential for the answer (e.g. where something is), add at the very end
 ATTACH: <file path exactly as linked in the note> (max 3). The bot sends those files. Never mention this mechanism.
 - You cannot save, change, move, rename or delete anything. Never claim or imitate that something was \
 saved, changed or committed (no "✅ Done", diffs or commit links). If the user asks for a change, tell them \
-to start the message with a command word: "zapíš …" to save, "oprav / premenuj / presuň / zmaž …" to edit.
+to start the message with a command word: "zapíš …" to save, "oprav / premenuj / presuň / zmaž …" to edit, "vráť / undo" to revert the last change.
 - Reply in the language the user writes in. Be concise. Use Discord markdown.
 
 === NOTES ({count} files) ===
@@ -190,6 +191,10 @@ def strip_accents(text: str) -> str:
 
 def slugify(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", strip_accents(text).lower()).strip("-")[:60]
+
+
+def is_revert_command(text: str) -> bool:
+    return bool(REVERT_TRIGGER.match(strip_accents(text)))
 
 
 def is_save_command(text: str) -> bool:
@@ -370,6 +375,17 @@ class MemoryStore:
     async def sync(self) -> bool:
         async with self._lock:
             return await self._sync_locked()
+
+    async def head_commit(self) -> dict:
+        """Latest commit on the branch, including its changed files."""
+        async with self._lock:
+            await self._sync_locked()
+            return await self._request("GET", f"/commits/{self.sha}")
+
+    async def tree_blobs(self, commit_sha: str) -> dict[str, str]:
+        """Repo path -> blob sha for every file in the given commit."""
+        tree = await self._request("GET", f"/git/trees/{commit_sha}", params={"recursive": "1"})
+        return {e["path"]: e["sha"] for e in tree["tree"] if e["type"] == "blob"}
 
     async def _sync_locked(self) -> bool:
         """Reload only notes whose blob changed since the last sync. Returns True if the head moved."""
@@ -909,7 +925,86 @@ class EditView(OwnerView):
         await self.cancel_action(interaction)
 
 
+@dataclass
+class RevertPlan:
+    commit: dict
+    changes: dict[str, BlobRef | None]  # note-relative path -> previous blob, or None = delete
+    skipped: list[str]  # files outside MEMORY_DIR, not reverted
+
+
+async def plan_revert() -> RevertPlan:
+    """Undo the latest commit: restore every file it touched to its parent's version."""
+    commit = await store.head_commit()
+    if len(commit["parents"]) != 1:
+        raise ValueError("The last commit is the first commit or a merge; it can't be reverted here.")
+    parent = await store.tree_blobs(commit["parents"][0]["sha"])
+    prefix = f"{MEMORY_DIR}/" if MEMORY_DIR else ""
+    changes: dict[str, BlobRef | None] = {}
+    skipped: list[str] = []
+    for f in commit["files"]:
+        name, status = f["filename"], f["status"]
+        if status == "renamed":
+            targets = [(name, None), (f["previous_filename"], parent.get(f["previous_filename"]))]
+        elif status in ("added", "copied"):
+            targets = [(name, None)]
+        else:  # modified, removed, changed
+            targets = [(name, parent.get(name))]
+        for path, sha in targets:
+            if not path.startswith(prefix):
+                skipped.append(path)
+                continue
+            changes[path[len(prefix):]] = BlobRef(sha) if sha else None
+    return RevertPlan(commit, changes, skipped)
+
+
+class RevertView(OwnerView):
+    def __init__(self, plan: RevertPlan):
+        super().__init__()
+        self.plan = plan
+
+    def render(self, status: str | None = None) -> str:
+        c = self.plan.commit
+        title = c["commit"]["message"].splitlines()[0][:200]
+        lines = [
+            status or "↩️ Revert the last commit?",
+            f"`{c['sha'][:7]}` {title}",
+            f"{c['commit']['author']['name']}, {c['commit']['author']['date'][:16].replace('T', ' ')} UTC",
+        ]
+        items = sorted(self.plan.changes.items())
+        for path, value in items[:15]:
+            lines.append(f"♻️ `{path}` restored" if value else f"🗑 `{path}` removed")
+        if len(items) > 15:
+            lines.append(f"… and {len(items) - 15} more files")
+        lines += [f"⚠️ `{p}` is outside `{MEMORY_DIR}/`, not reverted" for p in self.plan.skipped[:5]]
+        return "\n".join(lines)
+
+    def build(self) -> dict[str, str | bytes | BlobRef | None]:
+        if store.sha != self.plan.commit["sha"]:
+            raise ConflictError("There are newer commits since this preview, ask again.")
+        return dict(self.plan.changes)
+
+    @discord.ui.button(label="Revert", emoji="↩️", style=discord.ButtonStyle.danger)
+    async def revert(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        c = self.plan.commit
+        title = c["commit"]["message"].splitlines()[0][:150]
+        message = f'Revert "{title}" via Discord memory bot\n\nThis reverts commit {c["sha"]}.'
+        await self.run_commit(interaction, "⏳ Reverting…", lambda: store.apply(self.build, message))
+
+    @discord.ui.button(label="Cancel", emoji="❌", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await self.cancel_action(interaction)
+
+
 # --- Handlers ---
+async def handle_revert(channel: discord.abc.Messageable):
+    plan = await plan_revert()
+    if not plan.changes:
+        await channel.send(f"🤷 The last commit `{plan.commit['sha'][:7]}` changed nothing in `{MEMORY_DIR}/`.")
+        return
+    view = RevertView(plan)
+    view.message = await channel.send(view.render(), view=view)
+
+
 async def handle_answer(thread: discord.Thread, history: list[types.Content]):
     text, paths = extract_attach_lines(await gemini_answer(history))
     for chunk in split_message(text):
@@ -987,6 +1082,15 @@ async def on_ready():
     log.info("Logged in as %s (models: %s, thinking: %s)", bot.user, ", ".join(GEMINI_MODELS), GEMINI_THINKING or "default")
 
 
+@bot.command(name="undo", aliases=["revert"])
+async def undo_cmd(ctx: commands.Context):
+    try:
+        await handle_revert(ctx.channel)
+    except Exception as e:
+        log.exception("Revert failed")
+        await ctx.reply(f"❌ {type(e).__name__}: {str(e)[:300]}")
+
+
 @bot.command(name="sync")
 async def sync_cmd(ctx: commands.Context):
     try:
@@ -1041,6 +1145,9 @@ async def on_message(message: discord.Message):
 
     try:
         async with thread.typing():
+            if is_revert_command(message.content):
+                await handle_revert(thread)
+                return
             history, atts = await build_history(thread, include_pdfs=wants_pdf_read(message.content))
             if is_save_command(message.content):
                 await handle_save(thread, history, atts)
