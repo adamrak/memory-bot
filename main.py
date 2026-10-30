@@ -95,7 +95,7 @@ async def on_message(message):
             prompt = f"MEMORY CONTEXT:\n{memory_context}\n\nUSER QUESTION:\n{user_text}"
 
             response = gemini_client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.8-flash",
                 contents=prompt,
                 config={"system_instruction": system_instruction}
             )
