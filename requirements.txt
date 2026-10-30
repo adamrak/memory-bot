@@ -1,1 +1,4 @@
-
+discord.py
+google-genai
+PyGithub
+python-dotenv
