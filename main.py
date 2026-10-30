@@ -142,9 +142,12 @@ Return the minimal set of file changes:
 - action "delete": path, when the whole file should be removed (new_content empty).
 - To move content, update/delete the source file and update/create the target file.
 - Do not touch files that don't need to change.
-- Keep attachment links (lines starting with 📎) together with the facts they belong to; \
-remove them only when removing that fact. Copy them exactly as they are, also when moving a note; \
-the bot moves the files next to the note and fixes the links.
+- Copy attachment links (lines starting with 📎) byte-for-byte, also when moving or renaming a note \
+or folder. Never change the path inside a 📎 link; the bot moves the files next to the note and fixes \
+the links itself. Remove a 📎 line only when removing the fact it belongs to.
+- delete_attachments: paths (as linked) of files the user explicitly wants deleted, or that belong to \
+a note/fact the user explicitly asked to delete. Moving, renaming or editing never deletes files. \
+Otherwise return an empty list.
 - summary: one short sentence describing the change, in the user's language.
 - If the request is unclear or nothing matches, return no changes and explain why in summary.
 - Paths are relative, e.g. domacnost/pracka.md.
@@ -177,6 +180,7 @@ class FileChange(BaseModel):
 class EditPlan(BaseModel):
     summary: str
     changes: list[FileChange]
+    delete_attachments: list[str]
 
 
 # --- Helpers ---
@@ -650,8 +654,27 @@ def plan_attachment_moves(changes: dict[str, str | None], after: dict[str, str |
     return moves
 
 
-def prepare_edit(plan: EditPlan) -> tuple[dict[str, str | None], dict[str, str | None], list[str], dict[str, str]]:
-    """Returns (changes, base snapshot, orphaned attachments, attachment moves old -> new)."""
+def repair_links(changes: dict[str, str | None], base: dict[str, str | None]) -> dict[str, str]:
+    """Gemini sometimes rewrites 📎 links itself when moving notes, pointing to files that don't exist yet.
+    Map such links back to the real file (same file name, linked from one of the edited notes)."""
+    by_name: dict[str, list[str]] = {}
+    for ref in refs_in(v for v in base.values() if v) & store.attachments.keys():
+        by_name.setdefault(ref.rsplit("/", 1)[-1], []).append(ref)
+    fixes: dict[str, str] = {}
+    for text in changes.values():
+        for ref in refs_in([text] if text else []):
+            candidates = by_name.get(ref.rsplit("/", 1)[-1], [])
+            if ref not in store.attachments and len(candidates) == 1:
+                fixes[ref] = candidates[0]
+    return fixes
+
+
+EditPrep = tuple[dict[str, str | None], dict[str, str | None], list[str], list[str], dict[str, str]]
+
+
+def prepare_edit(plan: EditPlan) -> EditPrep:
+    """Returns (changes, base snapshot, attachments to delete, unlinked attachments kept, moves old -> new).
+    Attachments are deleted only when Gemini says the user explicitly asked for it."""
     changes: dict[str, str | None] = {}
     base: dict[str, str | None] = {}
     for c in plan.changes:
@@ -667,13 +690,17 @@ def prepare_edit(plan: EditPlan) -> tuple[dict[str, str | None], dict[str, str |
         if (old is None and new is None) or (old is not None and new is not None and old.rstrip() == new.rstrip()):
             continue
         changes[path], base[path] = new, old
+    fixes = repair_links(changes, base)
+    if fixes:
+        changes = {p: rewrite_links(v, fixes) if v is not None else None for p, v in changes.items()}
     moves = plan_attachment_moves(changes, {**store.files, **changes})
     if moves:
         changes = {p: rewrite_links(v, moves) if v is not None else None for p, v in changes.items()}
     after = {**store.files, **changes}
     linked_after = refs_in(v for v in after.values() if v is not None)
-    orphans = sorted((refs_in(store.files.values()) - linked_after - moves.keys()) & store.attachments.keys())
-    return changes, base, orphans, moves
+    unlinked = (refs_in(store.files.values()) - linked_after - moves.keys()) & store.attachments.keys()
+    requested = {relative_path(p) for p in plan.delete_attachments}
+    return changes, base, sorted(unlinked & requested), sorted(unlinked - requested), moves
 
 
 def render_diff(changes: dict[str, str | None], base: dict[str, str | None]) -> str:
@@ -830,7 +857,7 @@ class EditView(OwnerView):
     def __init__(self, plan: EditPlan):
         super().__init__()
         self.plan = plan
-        self.changes, self.base, self.orphans, self.moves = prepare_edit(plan)
+        self.changes, self.base, self.deletions, self.unlinked, self.moves = prepare_edit(plan)
         self.diff = render_diff(self.changes, self.base)
 
     @property
@@ -843,9 +870,12 @@ class EditView(OwnerView):
         lines += [f"📦 `{old}` → `{new}`" for old, new in moves[:5]]
         if len(moves) > 5:
             lines.append(f"📦 … and {len(moves) - 5} more attachments moved")
-        lines += [f"🗑 `{p}` (attachment no longer linked)" for p in self.orphans[:5]]
-        if len(self.orphans) > 5:
-            lines.append(f"🗑 … and {len(self.orphans) - 5} more attachments")
+        lines += [f"🗑 `{p}` (attachment deleted)" for p in self.deletions[:5]]
+        if len(self.deletions) > 5:
+            lines.append(f"🗑 … and {len(self.deletions) - 5} more attachments deleted")
+        lines += [f"⚠️ `{p}` is no longer linked from any note (file kept)" for p in self.unlinked[:5]]
+        if len(self.unlinked) > 5:
+            lines.append(f"⚠️ … and {len(self.unlinked) - 5} more unlinked files kept")
         diff = self.diff.replace("```", "'''")
         if self.diff_truncated:
             diff = diff[:EDIT_DIFF_CHARS] + "\n… (full diff in changes.diff)"
@@ -864,7 +894,7 @@ class EditView(OwnerView):
             changes[old] = None
         after = {**store.files, **self.changes}
         linked = refs_in(v for v in after.values() if v is not None)
-        for path in self.orphans:
+        for path in self.deletions:
             if path in store.attachments and path not in linked:
                 changes[path] = None
         return changes
