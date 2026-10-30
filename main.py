@@ -67,9 +67,7 @@ ATTACH_LINE = re.compile(r"^\s*ATTACH:\s*(\S+)\s*$", re.MULTILINE)
 PDF_READ_TRIGGER = re.compile(
     r"\b(precitaj|precitat|analyzuj|rozober|parsuj|vytiahni|read|parse|extract|analy[sz]e)\b", re.IGNORECASE
 )
-ATTACHMENT_LINK = re.compile(
-    r"\]\(" + (rf"/?(?:{re.escape(MEMORY_DIR)}/)?" if MEMORY_DIR else "/?") + r"(attachments/[^)\s]+)\)"
-)
+ATTACHMENT_LINK = re.compile(r"📎\s*\[[^\]]*\]\(([^)\s]+)\)")  # 📎 [name](/memory/path/file.pdf)
 
 ANSWER_PROMPT = """You are a personal memory assistant for a single user. Below are their notes \
 from a private GitHub repository (markdown files).
@@ -84,7 +82,7 @@ explicitly labelled as not coming from the notes.
 to ask you to read it (e.g. "prečítaj ten PDF").
 - Notes may link stored files (lines starting with 📎). If the user asks to see a stored file, or a stored \
 photo is essential for the answer (e.g. where something is), add at the very end one line per file: \
-ATTACH: attachments/<path> (max 3). The bot sends those files. Never mention this mechanism.
+ATTACH: <file path exactly as linked in the note> (max 3). The bot sends those files. Never mention this mechanism.
 - Reply in the language the user writes in. Be concise. Use Discord markdown.
 
 === NOTES ({count} files) ===
@@ -111,9 +109,13 @@ and a short table of contents with page numbers.
 Path:
 - If the user named a section/file (e.g. "do sekcie auto/stk"), use exactly that as the path \
 and set path_from_user=true.
-- Otherwise pick the best fitting existing file from the list below, or propose a new path \
-"<topic>/<subject>.md", e.g. auto/stk.md, domacnost/pracka.md, zdravie/ockovanie.md \
-(lowercase, kebab-case, no diacritics, reuse existing topic folders). Set path_from_user=false.
+- Otherwise choose the location yourself and set path_from_user=false. Paths can be nested as deep \
+as useful: <topic>/<subtopic>/…/<name>.md, e.g. auto/stk.md, domacnost/pracka.md, \
+elektronika/akaso-brave/akaso-brave.md.
+- Give a specific item (device, car, appliance, contract…) its own folder when it has or will likely \
+get several files (manual, receipt, photos, notes). Name the main note after the item.
+- Prefer existing folders and notes. Don't create a new level for a single small fact.
+- Names: lowercase, kebab-case, ASCII only, no diacritics, spaces or brackets.
 
 Attachments:
 - Attachments in this conversation are listed below (ref: filename, type, size).
@@ -123,7 +125,7 @@ Otherwise return an empty list.
 - Attachments marked "not read" were not shown to you: base the entry only on what the user said \
 and the filename, never guess their contents.
 
-Existing notes:
+Existing files:
 {tree}
 
 Attachments in this conversation:
@@ -188,8 +190,10 @@ def is_save_command(text: str) -> bool:
 def is_edit_command(text: str) -> bool:
     return bool(EDIT_TRIGGER.match(strip_accents(text)))
 
+
 def wants_pdf_read(text: str) -> bool:
     return bool(PDF_READ_TRIGGER.search(strip_accents(text)))
+
 
 def relative_path(raw: str) -> str:
     """Strip quotes, leading slash and MEMORY_DIR prefix: '/memory/auto/stk.md' -> 'auto/stk.md'."""
@@ -200,13 +204,20 @@ def relative_path(raw: str) -> str:
 
 
 def sanitize_path(raw: str) -> str:
-    """Normalize a note path relative to MEMORY_DIR, e.g. 'auto/stk.md'."""
-    parts = [p.strip() for p in relative_path(raw).split("/")]
-    parts = [p for p in parts if p and p != "."]
-    if not parts or any(p == ".." or p.startswith(".") for p in parts):
+    """Normalize a note path: 'Elektronika/Akaso (GoPro)/Návod' -> 'elektronika/akaso-gopro/navod.md'."""
+    path = relative_path(raw)
+    if path.lower().endswith(".md"):
+        path = path[:-3]
+    parts = [slugify(p) for p in path.split("/") if p.strip() not in ("", ".")]
+    if not parts or not all(parts):
         raise ValueError(f"Invalid path: {raw!r}")
-    path = "/".join(parts)
-    return path if path.lower().endswith(".md") else f"{path}.md"
+    return "/".join(parts) + ".md"
+
+
+def note_path(raw: str) -> str:
+    """Keep exact paths of existing notes; normalize new ones."""
+    rel = relative_path(raw)
+    return rel if rel in store.files else sanitize_path(raw)
 
 
 def split_message(text: str, limit: int = DISCORD_LIMIT) -> list[str]:
@@ -228,16 +239,13 @@ def link_target(path: str) -> str:
 
 
 def refs_in(texts) -> set[str]:
-    return {ref for text in texts for ref in ATTACHMENT_LINK.findall(text)}
+    return {relative_path(ref) for text in texts for ref in ATTACHMENT_LINK.findall(text)}
 
 
-def topic_of(note_path: str) -> str:
-    parts = note_path.split("/")
-    return parts[0] if len(parts) > 1 else "misc"
-
-
-def planned_attachment_path(note_path: str, name: str, ext: str) -> str:
-    return f"attachments/{topic_of(note_path)}/{date.today()}-{slugify(name) or 'file'}{ext}"
+def planned_attachment_path(note: str, name: str, ext: str) -> str:
+    """Attachments live next to their note: elektronika/akaso-brave/akaso-brave.md -> elektronika/akaso-brave/2026-10-30-navod.pdf"""
+    folder = note.rsplit("/", 1)[0] + "/" if "/" in note else ""
+    return f"{folder}{date.today()}-{slugify(name) or 'file'}{ext}"
 
 
 def prepare_file(data: bytes, filename: str, mime: str) -> tuple[bytes, str]:
@@ -356,10 +364,10 @@ class MemoryStore:
             if e["type"] != "blob" or not e["path"].startswith(prefix):
                 continue
             path = e["path"][len(prefix):]
-            if path.startswith("attachments/"):
-                attachments[path] = (e["sha"], e.get("size", 0))
-            elif path.lower().endswith(".md"):
+            if path.lower().endswith(".md"):
                 md_sha[path] = e["sha"]
+            else:
+                attachments[path] = (e["sha"], e.get("size", 0))
 
         changed = [p for p, s in md_sha.items() if self._md_sha.get(p) != s]
         semaphore = asyncio.Semaphore(8)
@@ -463,7 +471,7 @@ async def gemini_answer(history: list[types.Content]) -> str:
 async def gemini_save_plan(history: list[types.Content], atts: list[ThreadAttachment]) -> SavePlan:
     system = SAVE_PROMPT.format(
         today=date.today(),
-        tree="\n".join(sorted(store.files)) or "(no notes yet)",
+        tree="\n".join(sorted([*store.files, *store.attachments])) or "(empty)",
         attachments="\n".join(t.describe() for t in atts) or "(none)",
     )
     resp = await generate(
@@ -472,7 +480,7 @@ async def gemini_save_plan(history: list[types.Content], atts: list[ThreadAttach
     )
     plan = parse_json(resp, SavePlan)
     try:
-        plan.path = sanitize_path(plan.path)
+        plan.path = note_path(plan.path)
     except ValueError:
         plan.path, plan.path_from_user = "inbox.md", False
     return plan
@@ -597,12 +605,13 @@ def prepare_edit(plan: EditPlan) -> tuple[dict[str, str | None], dict[str, str |
     changes: dict[str, str | None] = {}
     base: dict[str, str | None] = {}
     for c in plan.changes:
+        ext = os.path.splitext(c.path.strip())[1].lower()
+        if ext and ext != ".md":
+            continue  # attachments are handled by the bot, not by Gemini
         try:
-            path = sanitize_path(c.path)
+            path = note_path(c.path)
         except ValueError:
             continue
-        if path.startswith("attachments/"):
-            continue  # attachments are handled by the bot, not by Gemini
         old = store.files.get(path)
         new = None if c.action == "delete" else c.new_content.rstrip() + "\n"
         if (old is None and new is None) or (old is not None and new is not None and old.rstrip() == new.rstrip()):
@@ -755,7 +764,7 @@ class PathModal(discord.ui.Modal, title="Change path"):
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            path = sanitize_path(self.path_input.value)
+            path = note_path(self.path_input.value)
         except ValueError as e:
             await interaction.response.send_message(f"❌ {e}", ephemeral=True)
             return
