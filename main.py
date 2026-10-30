@@ -41,6 +41,7 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 GEMINI_MODELS = [m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-3.5-flash").split(",") if m.strip()]
 GEMINI_THINKING = os.getenv("GEMINI_THINKING", "low").strip()  # "low" / "high" / empty = model default
 GEMINI_TIMEOUT_S = int(os.getenv("GEMINI_TIMEOUT_S", "45"))
+GEMINI_MEDIA_TIMEOUT_S = int(os.getenv("GEMINI_MEDIA_TIMEOUT_S", "120"))  # requests with images/PDFs
 SYNC_MINUTES = float(os.getenv("SYNC_MINUTES", "5"))
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "50"))
 HISTORY_MAX_CHARS = int(os.getenv("HISTORY_MAX_CHARS", "40000"))
@@ -63,6 +64,9 @@ EDIT_TRIGGER = re.compile(
     re.IGNORECASE,
 )
 ATTACH_LINE = re.compile(r"^\s*ATTACH:\s*(\S+)\s*$", re.MULTILINE)
+PDF_READ_TRIGGER = re.compile(
+    r"\b(precitaj|precitat|analyzuj|rozober|parsuj|vytiahni|read|parse|extract|analy[sz]e)\b", re.IGNORECASE
+)
 ATTACHMENT_LINK = re.compile(
     r"\]\(" + (rf"/?(?:{re.escape(MEMORY_DIR)}/)?" if MEMORY_DIR else "/?") + r"(attachments/[^)\s]+)\)"
 )
@@ -76,6 +80,8 @@ Rules:
 explicitly labelled as not coming from the notes.
 - Never invent personal facts (models, dates, places, people, numbers) that are not in the notes.
 - Images/PDFs the user sent in this conversation are included inline; use them.
+- Attachments marked "not read" were not shown to you. If the question needs one, tell the user \
+to ask you to read it (e.g. "prečítaj ten PDF").
 - Notes may link stored files (lines starting with 📎). If the user asks to see a stored file, or a stored \
 photo is essential for the answer (e.g. where something is), add at the very end one line per file: \
 ATTACH: attachments/<path> (max 3). The bot sends those files. Never mention this mechanism.
@@ -114,6 +120,8 @@ Attachments:
 - If the user wants to save some of them ("zapíš si to" right after a photo, "tú fotku", "všetky účtenky"), \
 list them with a short descriptive kebab-case name without extension or date, e.g. zarucak-pracka. \
 Otherwise return an empty list.
+- Attachments marked "not read" were not shown to you: base the entry only on what the user said \
+and the filename, never guess their contents.
 
 Existing notes:
 {tree}
@@ -180,6 +188,8 @@ def is_save_command(text: str) -> bool:
 def is_edit_command(text: str) -> bool:
     return bool(EDIT_TRIGGER.match(strip_accents(text)))
 
+def wants_pdf_read(text: str) -> bool:
+    return bool(PDF_READ_TRIGGER.search(strip_accents(text)))
 
 def relative_path(raw: str) -> str:
     """Strip quotes, leading slash and MEMORY_DIR prefix: '/memory/auto/stk.md' -> 'auto/stk.md'."""
@@ -420,15 +430,18 @@ def make_config(**kwargs) -> types.GenerateContentConfig:
 
 async def generate(contents, config: types.GenerateContentConfig) -> types.GenerateContentResponse:
     """Try models in order; fall back to the next one on server errors / timeouts."""
+    has_media = any(p.inline_data for c in contents for p in (c.parts or []))
+    timeout_s = GEMINI_MEDIA_TIMEOUT_S if has_media else GEMINI_TIMEOUT_S
+    config.http_options = types.HttpOptions(timeout=timeout_s * 1000)
     last_error: Exception | None = None
     for model in GEMINI_MODELS:
         start = time.monotonic()
         try:
             resp = await gemini.aio.models.generate_content(model=model, contents=contents, config=config)
-            log.info("Gemini %s answered in %.1fs", model, time.monotonic() - start)
+            log.info("Gemini %s answered in %.1fs (media: %s)", model, time.monotonic() - start, has_media)
             return resp
         except (errors.ServerError, httpx.TimeoutException) as e:
-            log.warning("Gemini %s failed after %.1fs: %s", model, time.monotonic() - start, e)
+            log.warning("Gemini %s failed after %.1fs (media: %s): %s", model, time.monotonic() - start, has_media, e)
             last_error = e
     raise last_error
 
@@ -475,7 +488,7 @@ async def gemini_edit_plan(history: list[types.Content]) -> EditPlan:
 
 
 # --- Thread history ---
-async def build_history(thread: discord.Thread) -> tuple[list[types.Content], list[ThreadAttachment]]:
+async def build_history(thread: discord.Thread, include_pdfs: bool) -> tuple[list[types.Content], list[ThreadAttachment]]:
     msgs = [m async for m in thread.history(limit=HISTORY_LIMIT)]
     msgs.reverse()
     if len(msgs) < HISTORY_LIMIT:  # thread was started from a channel message -> include it
@@ -508,9 +521,25 @@ async def build_history(thread: discord.Thread) -> tuple[list[types.Content], li
                 t = ThreadAttachment(f"A{len(atts) + 1}", a)
                 atts.append(t)
                 by_msg.setdefault(m.id, []).append(t)
-    inline = [t for t in atts if t.mime in INLINE_MIME and t.attachment.size <= MAX_INLINE_BYTES][-MAX_MEDIA:]
-    results = await asyncio.gather(*(t.attachment.read() for t in inline), return_exceptions=True)
-    loaded = {t.ref: r for t, r in zip(inline, results) if isinstance(r, bytes)}
+
+    # Photos are always sent; PDFs only when the user explicitly asks to read them
+    inline = [
+        t for t in atts
+        if t.mime in INLINE_MIME
+        and (include_pdfs or t.mime != "application/pdf")
+        and t.attachment.size <= MAX_INLINE_BYTES
+    ][-MAX_MEDIA:]
+
+    async def load(t: ThreadAttachment) -> tuple[bytes, str]:
+        data = await t.attachment.read()
+        if t.mime.startswith("image/"):  # shrink photos before sending them to Gemini
+            data, ext = await asyncio.to_thread(prepare_file, data, t.attachment.filename, t.mime)
+            if ext == ".jpg":
+                return data, "image/jpeg"
+        return data, t.mime
+
+    results = await asyncio.gather(*(load(t) for t in inline), return_exceptions=True)
+    loaded = {t.ref: r for t, r in zip(inline, results) if isinstance(r, tuple)}
 
     contents: list[types.Content] = []
     for m in kept:
@@ -518,10 +547,11 @@ async def build_history(thread: discord.Thread) -> tuple[list[types.Content], li
         parts = [types.Part.from_text(text=m.clean_content)] if m.clean_content else []
         for t in by_msg.get(m.id, []):
             if t.ref in loaded:
+                data, mime = loaded[t.ref]
                 parts.append(types.Part.from_text(text=f"[attachment {t.ref}: {t.attachment.filename}]"))
-                parts.append(types.Part.from_bytes(data=loaded[t.ref], mime_type=t.mime))
+                parts.append(types.Part.from_bytes(data=data, mime_type=mime))
             else:
-                parts.append(types.Part.from_text(text=f"[attachment {t.ref}: {t.attachment.filename} – not loaded]"))
+                parts.append(types.Part.from_text(text=f"[attachment {t.ref}: {t.attachment.filename} – not read]"))
         if not parts:
             continue
         if contents and contents[-1].role == role:
@@ -909,7 +939,7 @@ async def on_message(message: discord.Message):
 
     try:
         async with thread.typing():
-            history, atts = await build_history(thread)
+            history, atts = await build_history(thread, include_pdfs=wants_pdf_read(message.content))
             if is_save_command(message.content):
                 await handle_save(thread, history, atts)
             elif is_edit_command(message.content):
