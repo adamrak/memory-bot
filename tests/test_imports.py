@@ -6,7 +6,7 @@ import pytest
 
 @pytest.mark.parametrize("module", [
     "memorybot.config", "memorybot.paths", "memorybot.triggers", "memorybot.text", "memorybot.models",
-    "memorybot.changes", "memorybot.files", "memorybot.store", "memorybot.gemini", "memorybot.history",
+    "memorybot.changes", "memorybot.files", "memorybot.ratelimit", "memorybot.store", "memorybot.gemini", "memorybot.history",
     "memorybot.ui", "memorybot.bot",
 ])
 def test_module_imports(module):

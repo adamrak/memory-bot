@@ -124,7 +124,8 @@ def make_config(**kwargs) -> types.GenerateContentConfig:
 
 
 async def generate(contents: list[types.Content], config: types.GenerateContentConfig) -> types.GenerateContentResponse:
-    """Try models in order; fall back to the next one on server errors / timeouts."""
+    """Try models in order; fall back to the next one on server errors, timeouts and rate limits
+    (each model has its own quota)."""
     has_media = any(p.inline_data for c in contents for p in (c.parts or []))
     timeout_s = GEMINI_MEDIA_TIMEOUT_S if has_media else GEMINI_TIMEOUT_S
     config.http_options = types.HttpOptions(timeout=timeout_s * 1000)
@@ -135,7 +136,9 @@ async def generate(contents: list[types.Content], config: types.GenerateContentC
             resp = await client().aio.models.generate_content(model=model, contents=contents, config=config)
             log.info("Gemini %s answered in %.1fs (media: %s)", model, time.monotonic() - start, has_media)
             return resp
-        except (errors.ServerError, httpx.TimeoutException) as e:
+        except (errors.APIError, httpx.TimeoutException) as e:
+            if isinstance(e, errors.ClientError) and e.code != 429:
+                raise  # bad request etc. would fail the same way on every model
             log.warning("Gemini %s failed after %.1fs (media: %s): %s", model, time.monotonic() - start, has_media, e)
             last_error = e
     raise last_error

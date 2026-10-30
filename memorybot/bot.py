@@ -12,6 +12,7 @@ from google.genai import errors, types
 from . import config, gemini
 from .history import USER_MESSAGE_TYPES, ThreadAttachment, build_history
 from .paths import basename
+from .ratelimit import format_rate_limit, parse_rate_limit
 from .store import MemoryStore
 from .text import extract_attach_lines, split_message
 from .triggers import is_edit_command, is_revert_command, is_save_command, wants_pdf_read
@@ -201,7 +202,9 @@ async def on_message(message: discord.Message):
     except errors.APIError as e:
         log.exception("Gemini error")
         if e.code == 429:
-            await thread.send("⏳ Gemini rate limit, skús o chvíľu.")
+            limit = parse_rate_limit(e.details)
+            log.warning("Gemini rate limit: quota=%s retry_at=%s", limit.quota_id, limit.retry_at)
+            await thread.send(format_rate_limit(limit))
         else:
             await thread.send(f"❌ Gemini error {e.code}: {str(e.message)[:300]}")
     except httpx.TimeoutException:
