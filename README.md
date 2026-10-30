@@ -63,4 +63,25 @@ Fine-grained personal access token, **only the notes repo**, permission **Conten
 | `MAX_MEDIA` | | Newest N thread images/PDFs sent to Gemini, default `5` |
 | `MAX_ATTACHMENT_MB` | | Max size of a saved attachment, default `25` |
 
+## Development
+```
+python -m venv .venv && .venv/Scripts/activate   # Windows; on Linux/macOS: source .venv/bin/activate
+pip install -r requirements-dev.txt
+pytest
+```
+Tests run without any tokens: the GitHub store is tested against an in-memory fake API (`tests/fake_github.py`),
+and save/edit/move/revert planning is pure code in `memorybot/changes.py`. GitHub Actions runs them on every push;
+in Render set **Auto-Deploy → After CI checks pass** so a failing test blocks the deploy.
+
+| Module | What it does |
+|---|---|
+| `main.py` | Entry point (`python main.py`) |
+| `memorybot/bot.py` | Discord events, commands, routing, keep-alive server, periodic sync |
+| `memorybot/ui.py` | Previews with buttons (save / edit / revert) |
+| `memorybot/changes.py` | Pure planning of change sets — attachments follow notes, never deleted implicitly |
+| `memorybot/store.py` | GitHub cache + atomic multi-file commits (Git Data API) |
+| `memorybot/gemini.py` | Prompts and Gemini calls |
+| `memorybot/history.py` | Discord thread → Gemini conversation (photos inline, PDFs on request) |
+| `memorybot/paths.py`, `triggers.py`, `text.py`, `files.py` | Small helpers |
+
 > ⚠️ On the Gemini **free tier**, Google may use prompts for training. Your whole notes repo is sent with each question.
