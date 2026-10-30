@@ -31,6 +31,7 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))  # optional: only this channel + 
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 GITHUB_REPO = os.environ["GITHUB_REPO"]  # "owner/repo"
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "")  # empty = repo default branch
+MEMORY_DIR = os.getenv("MEMORY_DIR", "memory").strip("/")  # notes live here; empty = repo root
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 # Comma-separated, tried in order; next one is used when the previous times out / returns 5xx
 GEMINI_MODELS = [m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-3.8-flash,gemini-3.5-flash").split(",") if m.strip()]
@@ -76,9 +77,9 @@ of the useful facts and conclusions from the conversation. Facts only, no chit-c
 Path:
 - If the user named a section/file (e.g. "do sekcie auto/stk"), use exactly that as the path \
 and set path_from_user=true.
-- Otherwise pick the best fitting existing file from the list below, or propose a new path that \
-follows the existing folder conventions (lowercase, kebab-case, no diacritics). Set path_from_user=false.
-- The path is relative and ends with .md.
+- Otherwise pick the best fitting existing file from the list below, or propose a new path \
+"<topic>/<subject>.md", e.g. auto/stk.md, domacnost/pracka.md, zdravie/ockovanie.md \
+(lowercase, kebab-case, no diacritics, reuse existing topic folders). Set path_from_user=false.
 
 Existing files:
 {tree}"""
@@ -100,11 +101,14 @@ def is_save_command(text: str) -> bool:
 
 
 def sanitize_path(raw: str) -> str:
+    """Normalize to a path relative to MEMORY_DIR, e.g. 'auto/stk.md'."""
     parts = [p.strip() for p in raw.strip().strip("`").replace("\\", "/").split("/")]
     parts = [p for p in parts if p and p != "."]
     if not parts or any(p == ".." or p.startswith(".") for p in parts):
         raise ValueError(f"Invalid path: {raw!r}")
     path = "/".join(parts)
+    if MEMORY_DIR and path.startswith(f"{MEMORY_DIR}/"):  # user typed "memory/auto/stk"
+        path = path[len(MEMORY_DIR) + 1:]
     return path if path.lower().endswith(".md") else f"{path}.md"
 
 
@@ -130,13 +134,17 @@ def render_preview(plan: SavePlan, status: str = "💾 Save this?") -> str:
 
 
 def _extract_markdown(tar_gz: bytes) -> dict[str, str]:
+    """Returns {path relative to MEMORY_DIR: content} for every .md file under MEMORY_DIR."""
+    prefix = f"{MEMORY_DIR}/" if MEMORY_DIR else ""
     files = {}
     with tarfile.open(fileobj=io.BytesIO(tar_gz), mode="r:gz") as tar:
         for member in tar:
             if not member.isfile() or not member.name.lower().endswith(".md"):
                 continue
             path = member.name.split("/", 1)[1]  # strip "<owner>-<repo>-<sha>/" prefix
-            files[path] = tar.extractfile(member).read().decode("utf-8", errors="replace")
+            if not path.startswith(prefix):
+                continue
+            files[path[len(prefix):]] = tar.extractfile(member).read().decode("utf-8", errors="replace")
     return files
 
 
@@ -193,7 +201,8 @@ class MemoryStore:
 
     async def save(self, path: str, entry: str) -> tuple[str, bool]:
         """Append entry to path (create if missing). Returns (html_url, created)."""
-        url = f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/{quote(path)}"
+        repo_path = f"{MEMORY_DIR}/{path}" if MEMORY_DIR else path
+        url = f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/{quote(repo_path)}"
         async with self._lock:
             await self._ensure_branch()
             for attempt in range(3):
@@ -208,7 +217,7 @@ class MemoryStore:
 
                 content = f"{existing.rstrip()}\n\n{entry.strip()}\n" if existing else f"{entry.strip()}\n"
                 body = {
-                    "message": f"{'Create' if existing is None else 'Update'} {path} via Discord memory bot",
+                    "message": f"{'Create' if existing is None else 'Update'} {repo_path} via Discord memory bot",
                     "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
                     "branch": self.branch,
                 }
