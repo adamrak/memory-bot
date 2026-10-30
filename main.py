@@ -58,9 +58,10 @@ MAX_IMAGE_PX = 2048
 EDIT_DIFF_CHARS = 1400
 INLINE_MIME = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/heif", "application/pdf"}
 USER_MESSAGE_TYPES = (discord.MessageType.default, discord.MessageType.reply)
-SAVE_TRIGGER = re.compile(r"^\s*(zapis|zapisat|zapisu|uloz|ulozit|save)\b", re.IGNORECASE)
+SAVE_TRIGGER = re.compile(r"^\s*(zapis|zapisat|zapisu|uloz|ulozit|dopln|doplnit|pridaj|pridat|save|add)\b", re.IGNORECASE)
 EDIT_TRIGGER = re.compile(
-    r"^\s*(oprav|opravit|uprav|upravit|zmaz|zmazat|vymaz|vymazat|presun|presunut|edit|delete|remove|move)\b",
+    r"^\s*(oprav|opravit|uprav|upravit|zmen|zmenit|aktualizuj|aktualizovat|prepis|prepisat|zmaz|zmazat|vymaz|vymazat"
+    r"|presun|presunut|premenuj|premenovat|edit|update|delete|remove|move|rename)\b",
     re.IGNORECASE,
 )
 ATTACH_LINE = re.compile(r"^\s*ATTACH:\s*(\S+)\s*$", re.MULTILINE)
@@ -83,6 +84,9 @@ to ask you to read it (e.g. "prečítaj ten PDF").
 - Notes may link stored files (lines starting with 📎). If the user asks to see a stored file, or a stored \
 photo is essential for the answer (e.g. where something is), add at the very end one line per file: \
 ATTACH: <file path exactly as linked in the note> (max 3). The bot sends those files. Never mention this mechanism.
+- You cannot save, change, move, rename or delete anything. Never claim or imitate that something was \
+saved, changed or committed (no "✅ Done", diffs or commit links). If the user asks for a change, tell them \
+to start the message with a command word: "zapíš …" to save, "oprav / premenuj / presuň / zmaž …" to edit.
 - Reply in the language the user writes in. Be concise. Use Discord markdown.
 
 === NOTES ({count} files) ===
