@@ -1,105 +1,450 @@
+import asyncio
+import base64
+import io
+import logging
 import os
 import re
+import tarfile
+import unicodedata
+from datetime import date
+from urllib.parse import quote
+
+import aiohttp
 import discord
-from discord.ext import commands
+from aiohttp import web
+from discord.ext import commands, tasks
 from google import genai
-from github import Github
+from google.genai import errors, types
+from pydantic import BaseModel
 
-# Initialize APIs from environment variables
-github_client = Github(os.getenv("GITHUB_TOKEN"))
-repo = github_client.get_repo(os.getenv("GITHUB_REPO"))
-gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+log = logging.getLogger("memorybot")
 
-# Setup Discord Bot
+# --- Config (environment variables) ---
+DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
+OWNER_ID = int(os.environ["OWNER_ID"])
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))  # optional: only this channel + its threads
+GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+GITHUB_REPO = os.environ["GITHUB_REPO"]  # "owner/repo"
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "")  # empty = repo default branch
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+SYNC_MINUTES = float(os.getenv("SYNC_MINUTES", "5"))
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "50"))
+HISTORY_MAX_CHARS = int(os.getenv("HISTORY_MAX_CHARS", "40000"))
+PORT = os.getenv("PORT")  # set by Render -> starts keep-alive HTTP server
+
+GITHUB_API = "https://api.github.com"
+DISCORD_LIMIT = 2000
+PREVIEW_CHARS = 1700
+SAVE_TRIGGER = re.compile(r"^\s*(zapis|uloz|save)\b", re.IGNORECASE)
+
+ANSWER_PROMPT = """You are a personal memory assistant for a single user. Below are their notes \
+from a private GitHub repository (markdown files).
+
+Rules:
+- Answer primarily from the notes. When you use a note, cite its path like (📁 path/to/file.md).
+- If the notes do not contain the answer, say so clearly first. You may then add general knowledge, \
+explicitly labelled as not coming from the notes.
+- Never invent personal facts (models, dates, places, people, numbers) that are not in the notes.
+- Reply in the language the user writes in. Be concise. Use Discord markdown.
+
+=== NOTES ({count} files) ===
+{notes}
+=== END OF NOTES ===
+
+Today is {today}."""
+
+SAVE_PROMPT = """The user wants to save something into their personal notes repository. \
+Based on the conversation, decide WHAT to save and WHERE.
+
+Content:
+- If they ask to save a summary / the conversation / "this" / "it", write a concise markdown summary \
+of the useful facts and conclusions from the conversation. Facts only, no chit-chat.
+- If they dictate a specific fact, save it faithfully, only lightly cleaned up.
+- Start the entry with a heading line: "### {today} – <short title>".
+- Write in the language of the conversation.
+
+Path:
+- If the user named a section/file (e.g. "do sekcie auto/stk"), use exactly that as the path \
+and set path_from_user=true.
+- Otherwise pick the best fitting existing file from the list below, or propose a new path that \
+follows the existing folder conventions (lowercase, kebab-case, no diacritics). Set path_from_user=false.
+- The path is relative and ends with .md.
+
+Existing files:
+{tree}"""
+
+
+class SavePlan(BaseModel):
+    path: str
+    path_from_user: bool
+    content: str
+
+
+# --- Helpers ---
+def strip_accents(text: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
+
+
+def is_save_command(text: str) -> bool:
+    return bool(SAVE_TRIGGER.match(strip_accents(text)))
+
+
+def sanitize_path(raw: str) -> str:
+    parts = [p.strip() for p in raw.strip().strip("`").replace("\\", "/").split("/")]
+    parts = [p for p in parts if p and p != "."]
+    if not parts or any(p == ".." or p.startswith(".") for p in parts):
+        raise ValueError(f"Invalid path: {raw!r}")
+    path = "/".join(parts)
+    return path if path.lower().endswith(".md") else f"{path}.md"
+
+
+def split_message(text: str, limit: int = DISCORD_LIMIT) -> list[str]:
+    chunks = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut <= 0:
+            cut = limit
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    if text:
+        chunks.append(text)
+    return chunks
+
+
+def render_preview(plan: SavePlan, status: str = "💾 Save this?") -> str:
+    body = plan.content.replace("```", "'''")
+    if len(body) > PREVIEW_CHARS:
+        body = body[:PREVIEW_CHARS] + "\n…"
+    origin = "your path" if plan.path_from_user else "suggested"
+    return f"{status}\n📁 `{plan.path}` ({origin})\n```md\n{body}\n```"
+
+
+def _extract_markdown(tar_gz: bytes) -> dict[str, str]:
+    files = {}
+    with tarfile.open(fileobj=io.BytesIO(tar_gz), mode="r:gz") as tar:
+        for member in tar:
+            if not member.isfile() or not member.name.lower().endswith(".md"):
+                continue
+            path = member.name.split("/", 1)[1]  # strip "<owner>-<repo>-<sha>/" prefix
+            files[path] = tar.extractfile(member).read().decode("utf-8", errors="replace")
+    return files
+
+
+# --- GitHub-backed memory store ---
+class MemoryStore:
+    """In-memory copy of all .md files in the repo. GitHub stays the source of truth."""
+
+    def __init__(self):
+        self.files: dict[str, str] = {}
+        self.sha: str | None = None
+        self.branch = GITHUB_BRANCH
+        self._session: aiohttp.ClientSession | None = None
+        self._lock = asyncio.Lock()
+
+    async def start(self):
+        self._session = aiohttp.ClientSession(
+            headers={
+                "Authorization": f"Bearer {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=aiohttp.ClientTimeout(total=60),
+        )
+
+    async def close(self):
+        if self._session:
+            await self._session.close()
+
+    async def _ensure_branch(self):
+        if not self.branch:
+            async with self._session.get(f"{GITHUB_API}/repos/{GITHUB_REPO}") as r:
+                r.raise_for_status()
+                self.branch = (await r.json())["default_branch"]
+
+    async def sync(self) -> bool:
+        """Re-download the repo only if the branch head moved. Returns True if anything changed."""
+        async with self._lock:
+            await self._ensure_branch()
+            async with self._session.get(
+                f"{GITHUB_API}/repos/{GITHUB_REPO}/commits/{quote(self.branch)}",
+                headers={"Accept": "application/vnd.github.sha"},
+            ) as r:
+                r.raise_for_status()
+                head = (await r.text()).strip()
+            if head == self.sha:
+                return False
+            async with self._session.get(f"{GITHUB_API}/repos/{GITHUB_REPO}/tarball/{head}") as r:
+                r.raise_for_status()
+                data = await r.read()
+            self.files = await asyncio.to_thread(_extract_markdown, data)
+            self.sha = head
+            log.info("Synced %d notes @ %s", len(self.files), head[:7])
+            return True
+
+    async def save(self, path: str, entry: str) -> tuple[str, bool]:
+        """Append entry to path (create if missing). Returns (html_url, created)."""
+        url = f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/{quote(path)}"
+        async with self._lock:
+            await self._ensure_branch()
+            for attempt in range(3):
+                async with self._session.get(url, params={"ref": self.branch}) as r:
+                    if r.status == 404:
+                        existing, file_sha = None, None
+                    else:
+                        r.raise_for_status()
+                        j = await r.json()
+                        existing = base64.b64decode(j["content"]).decode("utf-8")
+                        file_sha = j["sha"]
+
+                content = f"{existing.rstrip()}\n\n{entry.strip()}\n" if existing else f"{entry.strip()}\n"
+                body = {
+                    "message": f"{'Create' if existing is None else 'Update'} {path} via Discord memory bot",
+                    "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+                    "branch": self.branch,
+                }
+                if file_sha:
+                    body["sha"] = file_sha
+
+                async with self._session.put(url, json=body) as r:
+                    if r.status == 409 and attempt < 2:  # file changed between read and write -> retry
+                        continue
+                    r.raise_for_status()
+                    j = await r.json()
+                # Next periodic sync picks up the new commit; update the cache now so answers see it immediately.
+                self.files[path] = content
+                return j["content"]["html_url"], existing is None
+        raise RuntimeError("GitHub write conflict, try again")
+
+
+store = MemoryStore()
+gemini = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=120_000))
+
+
+# --- Gemini ---
+async def gemini_answer(history: list[types.Content]) -> str:
+    notes = "\n".join(f"\n--- FILE: {p} ---\n{t}" for p, t in sorted(store.files.items())) or "(no notes yet)"
+    resp = await gemini.aio.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=history,
+        config=types.GenerateContentConfig(
+            system_instruction=ANSWER_PROMPT.format(count=len(store.files), notes=notes, today=date.today()),
+        ),
+    )
+    return resp.text or "⚠️ Gemini returned an empty response (possibly blocked by safety filters)."
+
+
+async def gemini_save_plan(history: list[types.Content]) -> SavePlan:
+    tree = "\n".join(sorted(store.files)) or "(empty repository)"
+    resp = await gemini.aio.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=history,
+        config=types.GenerateContentConfig(
+            system_instruction=SAVE_PROMPT.format(today=date.today(), tree=tree),
+            response_mime_type="application/json",
+            response_schema=SavePlan,
+        ),
+    )
+    plan = resp.parsed if isinstance(resp.parsed, SavePlan) else SavePlan.model_validate_json(resp.text or "")
+    try:
+        plan.path = sanitize_path(plan.path)
+    except ValueError:
+        plan.path, plan.path_from_user = "inbox.md", False
+    return plan
+
+
+# --- Discord ---
+async def build_history(thread: discord.Thread) -> list[types.Content]:
+    msgs = [m async for m in thread.history(limit=HISTORY_LIMIT)]
+    msgs.reverse()
+    if len(msgs) < HISTORY_LIMIT:  # thread was started from a channel message -> include it
+        starter = thread.starter_message
+        if starter is None and thread.parent:
+            try:
+                starter = await thread.parent.fetch_message(thread.id)
+            except discord.HTTPException:
+                starter = None
+        if starter:
+            msgs.insert(0, starter)
+
+    msgs = [m for m in msgs if m.type in (discord.MessageType.default, discord.MessageType.reply) and m.clean_content]
+
+    # Keep the newest messages within the char budget
+    kept, total = [], 0
+    for m in reversed(msgs):
+        total += len(m.clean_content)
+        if total > HISTORY_MAX_CHARS and kept:
+            break
+        kept.append(m)
+    kept.reverse()
+
+    contents: list[types.Content] = []
+    for m in kept:
+        role = "model" if m.author == bot.user else "user"
+        part = types.Part.from_text(text=m.clean_content)
+        if contents and contents[-1].role == role:
+            contents[-1].parts.append(part)
+        else:
+            contents.append(types.Content(role=role, parts=[part]))
+    while contents and contents[0].role == "model":
+        contents.pop(0)
+    return contents
+
+
+class SaveView(discord.ui.View):
+    def __init__(self, plan: SavePlan):
+        super().__init__(timeout=900)
+        self.plan = plan
+        self.message: discord.Message | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == OWNER_ID
+
+    @discord.ui.button(label="Save", emoji="✅", style=discord.ButtonStyle.success)
+    async def save(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.edit_message(content=render_preview(self.plan, "⏳ Saving…"), view=None)
+        try:
+            url, created = await store.save(self.plan.path, self.plan.content)
+        except Exception as e:
+            log.exception("Save failed")
+            status = f"❌ Save failed: {str(e)[:300]}"
+            await interaction.edit_original_response(content=render_preview(self.plan, status), view=self)
+            return
+        self.stop()
+        status = f"✅ {'Created' if created else 'Updated'} [{self.plan.path}](<{url}>)"
+        await interaction.edit_original_response(content=render_preview(self.plan, status), view=None)
+
+    @discord.ui.button(label="Change path", emoji="📝", style=discord.ButtonStyle.secondary)
+    async def change_path(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.send_modal(PathModal(self))
+
+    @discord.ui.button(label="Cancel", emoji="❌", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="❌ Cancelled, nothing saved.", view=None)
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(content=render_preview(self.plan, "⌛ Expired, nothing saved."), view=None)
+            except discord.HTTPException:
+                pass
+
+
+class PathModal(discord.ui.Modal, title="Change path"):
+    def __init__(self, save_view: SaveView):
+        super().__init__()
+        self.save_view = save_view
+        self.path_input = discord.ui.TextInput(
+            label="Path (e.g. auto/stk)", default=save_view.plan.path, max_length=200
+        )
+        self.add_item(self.path_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            path = sanitize_path(self.path_input.value)
+        except ValueError as e:
+            await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+            return
+        self.save_view.plan.path = path
+        self.save_view.plan.path_from_user = True
+        await interaction.response.edit_message(content=render_preview(self.save_view.plan), view=self.save_view)
+
+
+async def start_health_server(port: int):
+    async def health(_request):
+        return web.Response(text=f"ok, {len(store.files)} notes @ {(store.sha or '-')[:7]}")
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    log.info("Health server listening on :%d", port)
+
+
+@tasks.loop(minutes=SYNC_MINUTES)
+async def periodic_sync():
+    try:
+        await store.sync()
+    except Exception:
+        log.exception("Periodic sync failed")
+
+
+class MemoryBot(commands.Bot):
+    async def setup_hook(self):
+        await store.start()
+        if PORT:
+            await start_health_server(int(PORT))
+        periodic_sync.start()  # first iteration runs immediately = initial sync
+
+    async def close(self):
+        periodic_sync.cancel()
+        await store.close()
+        await super().close()
+
+
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = MemoryBot(command_prefix="!", intents=intents, owner_id=OWNER_ID)
 
-def get_repo_memory_context():
-    """Recursively fetches all .md files from the memory repository."""
-    context_text = ""
-    try:
-        # We start checking the root of the memory repository
-        contents = repo.get_contents("")
-        while contents:
-            file_content = contents.pop(0)
-            if file_content.type == "dir":
-                # Recursively fetch contents of subdirectories
-                contents.extend(repo.get_contents(file_content.path))
-            elif file_content.name.endswith(".md"):
-                decoded_text = file_content.decoded_content.decode("utf-8")
-                context_text += f"\n--- FILE: {file_content.path} ---\n{decoded_text}\n"
-    except Exception as e:
-        print(f"Error fetching repository contents: {e}")
-    
-    return context_text
-
-def save_to_memory(target_path, new_content):
-    """Creates or updates a Markdown file at any path (e.g., domacnost/pracka.md)."""
-    # Ensure path ends with .md
-    if not target_path.endswith(".md"):
-        target_path += ".md"
-    
-    # Clean up leading slashes if any
-    target_path = target_path.lstrip("/")
-    commit_message = f"Update {target_path} via Discord Memory Bot"
-    
-    try:
-        # Check if file exists to append content
-        existing_file = repo.get_contents(target_path)
-        existing_text = existing_file.decoded_content.decode("utf-8")
-        updated_content = f"{existing_text.strip()}\n\n{new_content.strip()}"
-        repo.update_file(existing_file.path, commit_message, updated_content, existing_file.sha)
-        return f"Updated `{target_path}` in memory repository."
-    except Exception:
-        # Create new file (GitHub API automatically creates intermediate directories if needed)
-        repo.create_file(target_path, commit_message, new_content.strip())
-        return f"Created `{target_path}` in memory repository."
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user}!")
+    log.info("Logged in as %s", bot.user)
+
+
+@bot.command(name="sync")
+async def sync_cmd(ctx: commands.Context):
+    try:
+        changed = await store.sync()
+    except Exception as e:
+        await ctx.reply(f"❌ Sync failed: {e}")
+        return
+    state = "🔄 Synced" if changed else "✅ Already up to date"
+    await ctx.reply(f"{state}: {len(store.files)} notes @ `{(store.sha or '-')[:7]}`")
+
 
 @bot.event
-async def on_message(message):
-    if message.author == bot.user:
+async def on_message(message: discord.Message):
+    if message.author.bot or message.author.id != OWNER_ID:
+        return
+    channel = message.channel
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        return
+    if CHANNEL_ID and CHANNEL_ID not in (channel.id, getattr(channel, "parent_id", None)):
+        return
+    if message.content.startswith(bot.command_prefix):
+        await bot.process_commands(message)
         return
 
-    if isinstance(message.channel, (discord.Thread, discord.TextChannel)):
-        async with message.channel.typing():
-            user_text = message.content.strip()
+    # One thread = one conversation
+    if isinstance(channel, discord.TextChannel):
+        title = " ".join(message.clean_content.split())[:80] or "Conversation"
+        thread = await message.create_thread(name=title, auto_archive_duration=1440)
+    else:
+        thread = channel
 
-            # Command format: "save: domacnost/pracka | Washing machine model XYZ is on the attic"
-            # Or default fallback: "save: Washing machine model XYZ" (saves to notes.md)
-            if user_text.lower().startswith(("save:", "zapis:", "zapíš:")):
-                try:
-                    payload = re.sub(r"^(save:|zapis:|zapíš:)", "", user_text, flags=re.IGNORECASE).strip()
-                    if "|" in payload:
-                        target_file, note = payload.split("|", 1)
-                    else:
-                        target_file, note = "notes.md", payload
-                    
-                    result_msg = save_to_memory(target_file.strip(), note.strip())
-                    await message.channel.send(f"✅ {result_msg}")
-                    return
-                except Exception as e:
-                    await message.channel.send(f"❌ Failed to save: {str(e)}")
-                    return
+    try:
+        async with thread.typing():
+            history = await build_history(thread)
+            if is_save_command(message.content):
+                plan = await gemini_save_plan(history)
+                view = SaveView(plan)
+                view.message = await thread.send(render_preview(plan), view=view)
+            else:
+                for chunk in split_message(await gemini_answer(history)):
+                    await thread.send(chunk)
+    except errors.APIError as e:
+        log.exception("Gemini error")
+        if e.code == 429:
+            await thread.send("⏳ Gemini rate limit, skús o chvíľu.")
+        else:
+            await thread.send(f"❌ Gemini error {e.code}: {str(e.message)[:300]}")
+    except Exception as e:
+        log.exception("Failed to handle message")
+        await thread.send(f"❌ {type(e).__name__}: {str(e)[:300]}")
 
-            # Default: Query memory context and respond
-            memory_context = get_repo_memory_context()
-            system_instruction = (
-                "You are an intelligent personal memory assistant. "
-                "Use the provided notes from the user's private memory repository to answer queries accurately."
-            )
-            prompt = f"MEMORY CONTEXT:\n{memory_context}\n\nUSER QUESTION:\n{user_text}"
 
-            response = gemini_client.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=prompt,
-                config={"system_instruction": system_instruction}
-            )
-
-            await message.channel.send(response.text)
-
-bot.run(os.getenv("DISCORD_TOKEN"))
+bot.run(DISCORD_TOKEN, root_logger=True)
