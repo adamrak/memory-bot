@@ -15,37 +15,34 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-MEMORY_DIR = "memory"
-
 def get_repo_memory_context():
-    """Fetches all .md files strictly from the memory/ directory."""
+    """Recursively fetches all .md files from the memory repository."""
     context_text = ""
     try:
-        contents = repo.get_contents(MEMORY_DIR)
+        # We start checking the root of the memory repository
+        contents = repo.get_contents("")
         while contents:
             file_content = contents.pop(0)
             if file_content.type == "dir":
+                # Recursively fetch contents of subdirectories
                 contents.extend(repo.get_contents(file_content.path))
             elif file_content.name.endswith(".md"):
                 decoded_text = file_content.decoded_content.decode("utf-8")
-                # Remove the 'memory/' prefix from display path for cleaner prompts
-                clean_path = file_content.path.replace(f"{MEMORY_DIR}/", "")
-                context_text += f"\n--- FILE: {clean_path} ---\n{decoded_text}\n"
+                context_text += f"\n--- FILE: {file_content.path} ---\n{decoded_text}\n"
     except Exception as e:
-        print(f"Error fetching memory directory: {e}")
+        print(f"Error fetching repository contents: {e}")
     
     return context_text
 
-def save_to_memory(filename, new_content):
-    """Creates or updates a Markdown file strictly inside the memory/ directory."""
-    # Ensure filename ends with .md
-    if not filename.endswith(".md"):
-        filename += ".md"
+def save_to_memory(target_path, new_content):
+    """Creates or updates a Markdown file at any path (e.g., domacnost/pracka.md)."""
+    # Ensure path ends with .md
+    if not target_path.endswith(".md"):
+        target_path += ".md"
     
-    # Clean user path and enforce memory/ folder prefix
-    clean_filename = os.path.basename(filename)
-    target_path = f"{MEMORY_DIR}/{clean_filename}"
-    commit_message = f"Update {clean_filename} via Discord Memory Bot"
+    # Clean up leading slashes if any
+    target_path = target_path.lstrip("/")
+    commit_message = f"Update {target_path} via Discord Memory Bot"
     
     try:
         # Check if file exists to append content
@@ -53,11 +50,11 @@ def save_to_memory(filename, new_content):
         existing_text = existing_file.decoded_content.decode("utf-8")
         updated_content = f"{existing_text.strip()}\n\n{new_content.strip()}"
         repo.update_file(existing_file.path, commit_message, updated_content, existing_file.sha)
-        return f"Updated `{clean_filename}` in memory repository."
+        return f"Updated `{target_path}` in memory repository."
     except Exception:
-        # Create new file if it doesn't exist
+        # Create new file (GitHub API automatically creates intermediate directories if needed)
         repo.create_file(target_path, commit_message, new_content.strip())
-        return f"Created `{clean_filename}` in memory repository."
+        return f"Created `{target_path}` in memory repository."
 
 @bot.event
 async def on_ready():
@@ -72,8 +69,8 @@ async def on_message(message):
         async with message.channel.typing():
             user_text = message.content.strip()
 
-            # Command format: "save: domacnost | Washing machine model XYZ"
-            # Or default fallback: "save: Washing machine model XYZ" (saves to memory/notes.md)
+            # Command format: "save: domacnost/pracka | Washing machine model XYZ is on the attic"
+            # Or default fallback: "save: Washing machine model XYZ" (saves to notes.md)
             if user_text.lower().startswith(("save:", "zapis:", "zapíš:")):
                 try:
                     payload = re.sub(r"^(save:|zapis:|zapíš:)", "", user_text, flags=re.IGNORECASE).strip()
