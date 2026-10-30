@@ -9,7 +9,8 @@ Personal assistant on Discord that answers from (and saves to) markdown notes in
   **✅ Save / 📝 Change path / ❌ Cancel**. Nothing is committed until you click Save. New text is appended to the note.
   Photos/PDFs from the thread can be saved too (pick them in the preview); they are stored **next to the note**.
 - `oprav …` / `zmaž …` / `presuň …` / `edit` / `delete` → Gemini proposes changes, you get a diff with **✅ Apply / ❌ Cancel**.
-  One commit per change; attachments no longer linked from any note are deleted with it.
+  One commit per change. Attachments follow their note: when a note moves, its files move next to it
+  (unless another note links them too); attachments no longer linked from any note are deleted.
 - Ask for a stored file ("ukáž mi návod k akaso") → the bot sends it (or a GitHub link if > 10 MB).
 - `!sync` → pull the latest notes from GitHub now (it also syncs automatically every 5 minutes).
 - `!ping` → test Gemini latency of each configured model.

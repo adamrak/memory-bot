@@ -139,7 +139,8 @@ Return the minimal set of file changes:
 - To move content, update/delete the source file and update/create the target file.
 - Do not touch files that don't need to change.
 - Keep attachment links (lines starting with 📎) together with the facts they belong to; \
-remove them only when removing that fact.
+remove them only when removing that fact. Copy them exactly as they are, also when moving a note; \
+the bot moves the files next to the note and fixes the links.
 - summary: one short sentence describing the change, in the user's language.
 - If the request is unclear or nothing matches, return no changes and explain why in summary.
 - Paths are relative, e.g. domacnost/pracka.md.
@@ -242,10 +243,22 @@ def refs_in(texts) -> set[str]:
     return {relative_path(ref) for text in texts for ref in ATTACHMENT_LINK.findall(text)}
 
 
+def rewrite_links(text: str, moves: dict[str, str]) -> str:
+    """Point 📎 links of moved attachments to their new location."""
+    def replace(m: re.Match) -> str:
+        new = moves.get(relative_path(m.group(1)))
+        return m.group(0).replace(m.group(1), link_target(new)) if new else m.group(0)
+
+    return ATTACHMENT_LINK.sub(replace, text)
+
+
+def folder_of(path: str) -> str:
+    return path.rsplit("/", 1)[0] + "/" if "/" in path else ""
+
+
 def planned_attachment_path(note: str, name: str, ext: str) -> str:
     """Attachments live next to their note: elektronika/akaso-brave/akaso-brave.md -> elektronika/akaso-brave/2026-10-30-navod.pdf"""
-    folder = note.rsplit("/", 1)[0] + "/" if "/" in note else ""
-    return f"{folder}{date.today()}-{slugify(name) or 'file'}{ext}"
+    return f"{folder_of(note)}{date.today()}-{slugify(name) or 'file'}{ext}"
 
 
 def prepare_file(data: bytes, filename: str, mime: str) -> tuple[bytes, str]:
@@ -293,6 +306,12 @@ class GitHubError(Exception):
 
 class ConflictError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class BlobRef:
+    """Reuse an existing blob, so attachments can be moved without downloading them."""
+    sha: str
 
 
 class MemoryStore:
@@ -384,9 +403,9 @@ class MemoryStore:
                  len(self.files), len(self.attachments), head[:7], len(changed))
         return True
 
-    async def apply(self, build: Callable[[], dict[str, str | bytes | None]], message: str) -> str:
+    async def apply(self, build: Callable[[], dict[str, str | bytes | BlobRef | None]], message: str) -> str:
         """Run build() against fresh state and commit its result atomically.
-        build returns {path: text | bytes (binary) | None (delete)}. Returns the commit URL."""
+        build returns {path: text | bytes (binary) | BlobRef (existing blob) | None (delete)}. Returns the commit URL."""
         async with self._lock:
             for attempt in range(3):
                 await self._sync_locked()
@@ -398,6 +417,8 @@ class MemoryStore:
                     entry = {"path": self.repo_path(path), "mode": "100644", "type": "blob"}
                     if value is None:
                         entry["sha"] = None
+                    elif isinstance(value, BlobRef):
+                        entry["sha"] = value.sha
                     elif isinstance(value, bytes):
                         blob = await self._request(
                             "POST", "/git/blobs",
@@ -600,8 +621,33 @@ async def save_note(plan: SavePlan, picks: list[tuple[ThreadAttachment, str]]) -
     return await store.apply(build, f"Save {store.repo_path(plan.path)} via Discord memory bot")
 
 
-def prepare_edit(plan: EditPlan) -> tuple[dict[str, str | None], dict[str, str | None], list[str]]:
-    """Returns (changes, base snapshot, orphaned attachments)."""
+def plan_attachment_moves(changes: dict[str, str | None], after: dict[str, str | None]) -> dict[str, str]:
+    """Attachments linked only from a changed note, but living in another folder, move next to that note."""
+    owners: dict[str, set[str]] = {}
+    for note, text in after.items():
+        if text is not None:
+            for ref in refs_in([text]):
+                owners.setdefault(ref, set()).add(note)
+    moves: dict[str, str] = {}
+    taken = set(store.attachments)
+    for note, text in changes.items():
+        if text is None:
+            continue
+        folder = folder_of(note)
+        for ref in sorted(refs_in([text])):
+            if ref not in store.attachments or ref in moves or owners.get(ref) != {note} or folder_of(ref) == folder:
+                continue  # unknown, shared with another note, or already in place
+            stem, ext = os.path.splitext(ref.rsplit("/", 1)[-1])
+            target, i = f"{folder}{stem}{ext}", 2
+            while target in taken:
+                target, i = f"{folder}{stem}-{i}{ext}", i + 1
+            taken.add(target)
+            moves[ref] = target
+    return moves
+
+
+def prepare_edit(plan: EditPlan) -> tuple[dict[str, str | None], dict[str, str | None], list[str], dict[str, str]]:
+    """Returns (changes, base snapshot, orphaned attachments, attachment moves old -> new)."""
     changes: dict[str, str | None] = {}
     base: dict[str, str | None] = {}
     for c in plan.changes:
@@ -617,10 +663,13 @@ def prepare_edit(plan: EditPlan) -> tuple[dict[str, str | None], dict[str, str |
         if (old is None and new is None) or (old is not None and new is not None and old.rstrip() == new.rstrip()):
             continue
         changes[path], base[path] = new, old
+    moves = plan_attachment_moves(changes, {**store.files, **changes})
+    if moves:
+        changes = {p: rewrite_links(v, moves) if v is not None else None for p, v in changes.items()}
     after = {**store.files, **changes}
     linked_after = refs_in(v for v in after.values() if v is not None)
-    orphans = sorted((refs_in(store.files.values()) - linked_after) & store.attachments.keys())
-    return changes, base, orphans
+    orphans = sorted((refs_in(store.files.values()) - linked_after - moves.keys()) & store.attachments.keys())
+    return changes, base, orphans, moves
 
 
 def render_diff(changes: dict[str, str | None], base: dict[str, str | None]) -> str:
@@ -777,7 +826,7 @@ class EditView(OwnerView):
     def __init__(self, plan: EditPlan):
         super().__init__()
         self.plan = plan
-        self.changes, self.base, self.orphans = prepare_edit(plan)
+        self.changes, self.base, self.orphans, self.moves = prepare_edit(plan)
         self.diff = render_diff(self.changes, self.base)
 
     @property
@@ -786,6 +835,10 @@ class EditView(OwnerView):
 
     def render(self, status: str | None = None) -> str:
         lines = [status or "✏️ Apply these changes?", self.plan.summary[:300]]
+        moves = list(self.moves.items())
+        lines += [f"📦 `{old}` → `{new}`" for old, new in moves[:5]]
+        if len(moves) > 5:
+            lines.append(f"📦 … and {len(moves) - 5} more attachments moved")
         lines += [f"🗑 `{p}` (attachment no longer linked)" for p in self.orphans[:5]]
         if len(self.orphans) > 5:
             lines.append(f"🗑 … and {len(self.orphans) - 5} more attachments")
@@ -794,11 +847,17 @@ class EditView(OwnerView):
             diff = diff[:EDIT_DIFF_CHARS] + "\n… (full diff in changes.diff)"
         return "\n".join(lines) + f"\n```diff\n{diff}\n```"
 
-    def build(self) -> dict[str, str | bytes | None]:
+    def build(self) -> dict[str, str | bytes | BlobRef | None]:
         for path, old in self.base.items():
             if store.files.get(path) != old:
                 raise ConflictError(f"`{path}` changed since this preview, ask again.")
-        changes: dict[str, str | bytes | None] = dict(self.changes)
+        for old, new in self.moves.items():
+            if old not in store.attachments or new in store.attachments:
+                raise ConflictError(f"`{old}` changed since this preview, ask again.")
+        changes: dict[str, str | bytes | BlobRef | None] = dict(self.changes)
+        for old, new in self.moves.items():
+            changes[new] = BlobRef(store.attachments[old][0])
+            changes[old] = None
         after = {**store.files, **self.changes}
         linked = refs_in(v for v in after.values() if v is not None)
         for path in self.orphans:
